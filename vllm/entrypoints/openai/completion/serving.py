@@ -160,7 +160,8 @@ class OpenAIServingCompletion(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                prompt_text = self._extract_prompt_text(engine_prompt)
+                sub_request_id = f"{request_id}-{i}"
+                prompt_text = self._extract_prompt_text(engine_prompt, sub_request_id)
 
                 max_tokens = get_max_tokens(
                     self.max_model_len,
@@ -277,7 +278,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 # with the inputs token IDs
                 if final_res.prompt is None:
                     engine_prompt = engine_prompts[i]
-                    final_res.prompt = self._extract_prompt_text(engine_prompt)
+                    final_res.prompt = self._extract_prompt_text(engine_prompt, f"{request_id}-{i}")
 
             final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
 
@@ -347,7 +348,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_text = res.prompt
                 if prompt_text is None:
                     engine_prompt = engine_prompts[prompt_idx]
-                    prompt_text = self._extract_prompt_text(engine_prompt)
+                    prompt_text = self._extract_prompt_text(engine_prompt, request_id)
 
                 # Prompt details are excluded from later streamed outputs
                 if prompt_token_ids is not None:
@@ -601,6 +602,16 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         request_metadata.final_usage_info = usage
+
+        # Log responses to file
+        from vllm.entrypoints.openai.engine.serving import get_prompt_response_logger
+        for choice in choices:
+            get_prompt_response_logger().log_response(
+                request_id,
+                choice.text,
+                choice.finish_reason,
+            )
+
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
         return CompletionResponse(

@@ -378,13 +378,13 @@ class OpenAIServingChat(OpenAIServing):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                prompt_text = self._extract_prompt_text(engine_prompt)
-
                 # If we are creating sub requests for multiple prompts, ensure that they
                 # have unique request ids.
                 sub_request_id = (
                     request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
                 )
+
+                prompt_text = self._extract_prompt_text(engine_prompt, sub_request_id)
 
                 max_tokens = get_max_tokens(
                     self.max_model_len,
@@ -1362,6 +1362,20 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            # Log streaming responses to file
+            from vllm.entrypoints.openai.engine.serving import get_prompt_response_logger
+            for i in range(num_choices):
+                full_text = (
+                    previous_texts[i]
+                    if previous_texts and i < len(previous_texts)
+                    else ""
+                )
+                get_prompt_response_logger().log_response(
+                    request_id,
+                    full_text,
+                    "streaming_complete",
+                )
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
@@ -1749,6 +1763,15 @@ class OpenAIServingChat(OpenAIServing):
             ),
             kv_transfer_params=final_res.kv_transfer_params,
         )
+
+        # Log prompts/responses to file
+        from vllm.entrypoints.openai.engine.serving import get_prompt_response_logger
+        for choice in choices:
+            get_prompt_response_logger().log_response(
+                request_id,
+                choice.message.content,
+                choice.finish_reason,
+            )
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:

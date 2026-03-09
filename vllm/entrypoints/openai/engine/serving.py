@@ -125,6 +125,58 @@ from vllm.utils.async_utils import (
     merge_async_iterators,
 )
 
+import os
+import datetime
+from pathlib import Path
+
+
+class PromptResponseFileLogger:
+    """Dumps all prompts and responses to a structured log file."""
+
+    def __init__(self, log_dir: str | None = None):
+        log_dir = log_dir or os.environ.get(
+            "VLLM_PROMPT_LOG_DIR", "/tmp/vllm_prompt_logs"
+        )
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        pid = os.getpid()
+        self.log_path = os.path.join(log_dir, f"prompts_responses_{timestamp}_{pid}.jsonl")
+        logger.info("Prompt/response logging enabled: %s", self.log_path)
+
+    def log_prompt(self, request_id: str, prompt_text: str | None):
+        self._write({
+            "type": "prompt",
+            "timestamp": datetime.datetime.now().isoformat(),
+            "request_id": request_id,
+            "prompt": prompt_text,
+        })
+
+    def log_response(self, request_id: str, response_text: str | None, finish_reason: str | None = None):
+        self._write({
+            "type": "response",
+            "timestamp": datetime.datetime.now().isoformat(),
+            "request_id": request_id,
+            "response": response_text,
+            "finish_reason": finish_reason,
+        })
+
+    def _write(self, record: dict):
+        try:
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("Failed to write prompt/response log")
+
+
+# Global instance — initialized lazily
+_pr_logger: PromptResponseFileLogger | None = None
+
+def get_prompt_response_logger() -> PromptResponseFileLogger:
+    global _pr_logger
+    if _pr_logger is None:
+        _pr_logger = PromptResponseFileLogger()
+    return _pr_logger
+
 
 class GenerationError(Exception):
     """raised when finish_reason indicates internal server error (500)"""
@@ -1048,8 +1100,16 @@ class OpenAIServing:
     def _extract_prompt_components(self, prompt: object):
         return extract_prompt_components(self.model_config, prompt)
 
-    def _extract_prompt_text(self, prompt: object):
-        return self._extract_prompt_components(prompt).text
+    def _extract_prompt_text(self, prompt: object, request_id: str | None = None):
+        components = self._extract_prompt_components(prompt)
+        text = components.text
+        if text is None and components.token_ids is not None:
+            tokenizer = self.renderer.get_tokenizer()
+            text = tokenizer.decode(components.token_ids)
+        #logger.info("PROMPT TEXT: %s", text)
+        if request_id:
+            get_prompt_response_logger().log_prompt(request_id, text)
+        return components.text  # return original (None) to not break callers
 
     def _extract_prompt_len(self, prompt: object):
         return extract_prompt_len(self.model_config, prompt)
@@ -1089,7 +1149,7 @@ class OpenAIServing:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
     ):
-        prompt_text = self._extract_prompt_text(engine_prompt)
+        prompt_text = self._extract_prompt_text(engine_prompt, request_id)
 
         orig_priority = priority
         sub_request = 0
@@ -1159,7 +1219,7 @@ class OpenAIServing:
                     context.chat_template_content_format,
                 )
                 engine_prompt = engine_prompts[0]
-                prompt_text = self._extract_prompt_text(engine_prompt)
+                prompt_text = self._extract_prompt_text(engine_prompt, request_id)
 
                 sampling_params.max_tokens = get_max_tokens(
                     self.max_model_len,

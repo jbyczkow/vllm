@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_LOG_REQUESTS_JSONL: str | None = None
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -617,6 +618,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False"
     ).lower()
     == "true",
+    # Path to JSONL file for logging raw HTTP requests/responses
+    "VLLM_LOG_REQUESTS_JSONL": lambda: os.environ.get(
+        "VLLM_LOG_REQUESTS_JSONL", None
+    ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
     "S3_SECRET_ACCESS_KEY": lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
@@ -1642,6 +1647,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "VLLM_LOG_REQUESTS_JSONL",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",

@@ -258,6 +258,12 @@ def build_app(
         )
         app.middleware("http")(log_response)
 
+    if envs.VLLM_LOG_REQUESTS_JSONL:
+        from vllm.entrypoints.openai.server_utils import log_requests_jsonl
+        logger.info("Logging all API requests/responses to %s",
+                    envs.VLLM_LOG_REQUESTS_JSONL)
+        app.middleware("http")(log_requests_jsonl)
+
     for middleware in args.middleware:
         module_path, object_name = middleware.rsplit(".", 1)
         imported = getattr(importlib.import_module(module_path), object_name)

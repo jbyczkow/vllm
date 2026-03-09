@@ -380,3 +380,66 @@ async def lifespan(app: FastAPI):
     finally:
         # Ensure app state including engine ref is gc'd
         del app.state
+
+
+async def log_requests_jsonl(request: Request, call_next):
+    """Log every /v1/completions and /v1/chat/completions request+response
+    to a JSONL file specified by VLLM_LOG_REQUESTS_JSONL.
+
+    Each line is a JSON object with:
+      timestamp, request_id, method, path, status_code, elapsed_s,
+      request (the full HTTP body), response (the full HTTP body).
+    """
+    import time
+    from datetime import datetime, timezone
+
+    path = request.url.path
+    # Only log completion endpoints
+    if path not in ("/v1/completions", "/v1/chat/completions"):
+        return await call_next(request)
+
+    ts = datetime.now(timezone.utc).isoformat()
+    req_id = request.headers.get("x-request-id", "")
+
+    # Read request body
+    body_bytes = await request.body()
+    try:
+        req_body = json.loads(body_bytes)
+    except Exception:
+        req_body = body_bytes.decode("utf-8", errors="replace")
+
+    t0 = time.monotonic()
+    response = await call_next(request)
+    elapsed = time.monotonic() - t0
+
+    # Capture response body (must drain the async iterator then re-wrap)
+    resp_chunks = [section async for section in response.body_iterator]
+    response.body_iterator = iterate_in_threadpool(iter(resp_chunks))
+
+    try:
+        resp_text = b"".join(
+            c if isinstance(c, bytes) else c.encode() for c in resp_chunks
+        ).decode("utf-8", errors="replace")
+        resp_body = json.loads(resp_text)
+    except Exception:
+        resp_body = resp_text if resp_text else "<empty>"
+
+    record = {
+        "timestamp": ts,
+        "request_id": req_id,
+        "method": request.method,
+        "path": path,
+        "status_code": response.status_code,
+        "elapsed_s": round(elapsed, 3),
+        "request": req_body,
+        "response": resp_body,
+    }
+
+    log_path = envs.VLLM_LOG_REQUESTS_JSONL
+    try:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("Failed to write request log to %s", log_path)
+
+    return response

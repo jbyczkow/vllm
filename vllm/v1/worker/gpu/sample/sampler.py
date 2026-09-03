@@ -7,6 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.config.reasoning import ReasoningConfig
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -28,6 +29,47 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+
+
+def xpu_kernel_sample(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    logprobs_mode: LogprobsMode,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused top-k/top-p + sample via the XPU kernel (torch.ops._xpu_C).
+
+    Mirrors TopKTopPSampler.forward_xpu (vllm/v1/sample/ops/topk_topp_sampler.py):
+    global device RNG (no per-request seeds), so callers must first exclude
+    batches with any explicit per-request seed.
+    """
+    if not logits.is_contiguous() or logits.dtype != torch.float32:
+        logits = logits.contiguous().to(torch.float32)
+    random_sampled = torch.empty(
+        logits.shape[0], dtype=torch.int64, device=logits.device
+    )
+    logits_to_return = None
+    if logprobs_mode in PROCESSED_LOGPROBS_MODES:
+        logits_to_return = torch.empty_like(logits)
+
+    generator = torch.xpu.default_generators[logits.device.index]
+    state = generator.get_state()
+    seed, offset = state.view(torch.int64)
+    seeds = torch.tensor([seed, offset], dtype=torch.int64, device=torch.device("cpu"))
+
+    # The XPU kernel expects k as int64 (Long); SamplingStates stores it as int32.
+    if k is not None:
+        k = k.to(torch.int64)
+
+    torch.ops.vllm.xpu_topk_topp_sampler(
+        random_sampled, logits_to_return, logits, k, p, logprobs_mode, seeds
+    )
+    # The kernel consumes RNG values internally; advance the default generator's
+    # offset to keep future draws deterministic (offset must be multiple of 4).
+    offset = (offset + logits.numel() + 3) // 4 * 4
+    state.view(torch.int64)[1] = offset
+    generator.set_state(state)
+    return random_sampled, (logits_to_return if logits_to_return is not None else logits)
 
 
 class Sampler:
@@ -63,6 +105,14 @@ class Sampler:
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
             not return_sampling_mask and flashinfer_sampler_supported()
+        )
+        # XPU kernel is a global-RNG op (one seed/offset pair per call, like
+        # flashinfer), so it is excluded whenever any request needs a
+        # reproducible per-request seed. See any_explicit_seed usage in sample().
+        self.use_xpu_kernel = (
+            not return_sampling_mask
+            and current_platform.is_xpu()
+            and envs.VLLM_XPU_USE_SAMPLER_KERNEL
         )
 
     def add_request(
@@ -295,19 +345,25 @@ class Sampler:
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )
-        use_flashinfer = self.use_flashinfer and not (
-            # Don't use FI sampler if no requests use top_k/top_p, if there are
-            # any greedy requests or per-request seeds, or if post-processed
-            # logprobs need to be returned for any requests.
+        # Don't use FI/XPU kernel if no requests use top_k/top_p, if there are
+        # any greedy requests or per-request seeds, or if post-processed
+        # logprobs need to be returned for any requests.
+        skip_global_rng_kernel = (
             (top_k is None and top_p is None)
             or (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
         )
+        use_flashinfer = self.use_flashinfer and not skip_global_rng_kernel
+        use_xpu_kernel = self.use_xpu_kernel and not skip_global_rng_kernel
 
         # Sample the next token.
         if use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+        elif use_xpu_kernel:
+            sampled, processed_logits = xpu_kernel_sample(
+                processed_logits, top_k, top_p, self.logprobs_mode
+            )
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
             sampled = gumbel_sample(

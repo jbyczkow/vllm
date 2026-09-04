@@ -734,6 +734,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 )
             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
 
+    def _concat_nope_pe(self, nope: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+        """Concat a nope tensor with a (possibly head-broadcast) pe tensor.
+
+        Generic, cross-platform equivalent of the CUDA fused key/query concat
+        epilogues, used as the non-CUDA fallback below.
+        """
+        out = torch.empty(
+            (*nope.shape[:-1], nope.shape[-1] + pe.shape[-1]),
+            dtype=nope.dtype,
+            device=nope.device,
+        )
+        out[..., : nope.shape[-1]] = nope
+        out[..., nope.shape[-1] :] = pe
+        return out
+
     def _decode_concat_cache(
         self,
         ql_nope: torch.Tensor,
@@ -783,16 +798,32 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 # quantization.
                 mqa_q = (mqa_q.to(torch.float32) * self._q_scale).to(ql_nope.dtype)
             return mqa_q
-        return fused_mla_decode_q_concat_kv_cache_insert(
-            ql_nope,
-            q_pe,
+        if current_platform.is_cuda():
+            return fused_mla_decode_q_concat_kv_cache_insert(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                self.kv_cache,
+                slot_mapping,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+            )
+        # No fused decode epilogue outside CUDA: apply RoPE, concat the
+        # absorbed query, and cache the latent via the generic MLA ops.
+        if positions is not None:
+            assert self.rotary_emb is not None
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        mqa_q = self._concat_nope_pe(ql_nope, q_pe)
+        ops.concat_and_cache_mla(
             kv_c_normed,
-            k_pe,
+            k_pe.squeeze(1),
             self.kv_cache,
             slot_mapping,
-            positions=positions,
-            cos_sin_cache=cos_sin_cache,
+            kv_cache_dtype=self.kv_cache_dtype,
+            scale=self._k_scale,
         )
+        return mqa_q
 
     def _compute_prefill_context(
         self,
@@ -857,8 +888,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             k_pe = gathered[..., self.kv_lora_rank :]
             if fp8_prefill:
                 k, v = fused_mla_kv_concat_quant_fp8(k_nope, k_pe, v)
-            else:
+            elif current_platform.is_cuda():
                 k = fused_mla_kv_concat(k_nope, k_pe)
+            else:
+                # No fused epilogue outside CUDA: concat K via generic ops.
+                # k_pe was already rotated on the way into the cache.
+                k = self._concat_nope_pe(k_nope, k_pe.unsqueeze(1))
             attn_output, attn_lse = prefill_backend.run_prefill_context_chunk(
                 chunk=chunk, q=q[chunk.token_slice], k=k, v=v, out=out
             )
@@ -1045,7 +1080,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 positions,
                 cos_sin_cache,
             )
-        else:
+        elif current_platform.is_cuda():
             # Concat full K = [k_nope | k_pe] and insert [kv_c_normed | k_pe]
             # into the paged cache for these prefill tokens, in one launch.
             k = fused_mla_key_concat_kv_cache_insert(
@@ -1057,6 +1092,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 slot_mapping,
                 positions,
                 cos_sin_cache,
+            )
+        else:
+            # No fused epilogue outside CUDA: apply RoPE, concat K, and cache
+            # the latent via the generic cross-platform MLA ops instead.
+            if positions is not None:
+                assert self.rotary_emb is not None
+                q_nope, q_pe = q.split(
+                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                q = self._concat_nope_pe(q_nope, q_pe)
+            k = self._concat_nope_pe(k_nope, k_pe)
+            ops.concat_and_cache_mla(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                self.kv_cache,
+                slot_mapping,
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
             )
 
         # When there is no chunked context, backends that honor `out` write the

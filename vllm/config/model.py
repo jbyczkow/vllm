@@ -2169,6 +2169,19 @@ class ModelConfig:
             and "nvfp4" in quant_config.get("format", "").lower()
         )
 
+    def is_fp8_quantized(self) -> bool:
+        # Native fp8 and ModelOpt fp8 checkpoints
+        if self.quantization in ("fp8", "modelopt"):
+            return True
+
+        # Compressed Tensors fp8 checkpoints use a float-quantized format
+        quant_config = self.model_arch_config.quantization_config
+        return (
+            self.quantization == "compressed-tensors"
+            and quant_config is not None
+            and "float" in quant_config.get("format", "").lower()
+        )
+
 
 def get_served_model_name(model: str, served_model_name: str | list[str] | None):
     """

@@ -678,6 +678,21 @@ class VllmConfig:
                 )
                 return False
 
+        # Hybrid (Mamba) fp8 MoE models exhaust GPU resources during Model
+        # Runner V2 warmup on XPU, crashing with OUT_OF_RESOURCES/DEVICE_LOST.
+        if (
+            model_config is not None
+            and current_platform.is_xpu()
+            and model_config.is_hybrid
+            and model_config.is_moe
+            and model_config.is_fp8_quantized()
+        ):
+            logger.warning_once(
+                "Defaulting to the V1 model runner on XPU for hybrid (Mamba) "
+                "fp8 MoE models; set VLLM_USE_V2_MODEL_RUNNER=1 to override."
+            )
+            return False
+
         if not HAS_TRITON:
             logger.warning_once(
                 "Model Runner V2 requires Triton; using the V1 model runner instead."

@@ -1049,6 +1049,7 @@ class xpu_ops:
         dynamic_causal: torch.Tensor | None = None,
         mask_mod: Callable | None = None,
         aux_tensors: list | None = None,
+        q_v: torch.Tensor | None = None,
         **kwargs,
     ):
         assert cu_seqlens_k is not None or seqused_k is not None, (
@@ -1097,6 +1098,7 @@ class xpu_ops:
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            q_v=q_v,
         )
 
     @staticmethod

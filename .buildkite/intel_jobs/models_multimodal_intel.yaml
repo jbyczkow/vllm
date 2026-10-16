@@ -151,3 +151,29 @@ steps:
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
       'cd tests &&
       pytest -v -s models/multimodal/test_mapping.py'
+
+- label: ":intel: (BMG) dots3 NOTE Unit Tests"
+  key: dots3-note-unit-tests
+  timeout_in_minutes: 20
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+  - vllm/models/dots3_note/
+  - vllm/_xpu_ops.py
+  - vllm/v1/attention/backends/fa_utils.py
+  - vllm/utils/deep_gemm.py
+  - tests/models/dots3_note/
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s models/dots3_note'

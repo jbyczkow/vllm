@@ -48,3 +48,30 @@ steps:
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
       'cd tests &&
       pytest -v -s kernels/core/test_uva.py'
+
+- label: ":intel: (BMG) FlashAttention Utils XPU Tests"
+  key: fa-utils-xpu-tests
+  timeout_in_minutes: 20
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+    - vllm/_xpu_ops.py
+    - vllm/v1/attention/backends/fa_utils.py
+    - vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+    - tests/v1/attention/test_fa_utils_xpu.py
+    - tests/v1/attention/test_flashattn_mla_sparse_xpu.py
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s v1/attention/test_fa_utils_xpu.py
+      v1/attention/test_flashattn_mla_sparse_xpu.py'
